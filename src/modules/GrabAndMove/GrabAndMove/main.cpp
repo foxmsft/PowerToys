@@ -897,6 +897,17 @@ static HWND ResolveTargetWindow(POINT pt)
     return hwnd;
 }
 
+// Detects mouse events synthesized from touch or pen pointer input.
+// Windows sets a signature in dwExtraInfo when it converts WM_POINTER*
+// messages to legacy WM_MOUSE* messages.  Bit 7 of the low byte
+// distinguishes touch (set) from pen (clear); we accept both.
+static constexpr bool IsPointerSynthesized(ULONG_PTR dwExtraInfo)
+{
+    constexpr ULONG_PTR POINTER_SIGNATURE_MASK = 0xFFFFFF00;
+    constexpr ULONG_PTR POINTER_SIGNATURE      = 0xFF515700;
+    return (dwExtraInfo & POINTER_SIGNATURE_MASK) == POINTER_SIGNATURE;
+}
+
 // Forward declarations for helpers called from MouseProc
 static void HandleDragMove(POINT pt);
 static void HandleDragResize(POINT pt);
@@ -907,8 +918,10 @@ static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam)
     {
         auto* ms = reinterpret_cast<MSLLHOOKSTRUCT*>(lParam);
 
-        // Ignore injected events to avoid feedback loops
-        if (ms->flags & LLMHF_INJECTED)
+        // Skip software-injected events (SendInput / mouse_event) to avoid
+        // interference, but allow touch/pen-synthesized events through so
+        // that touchscreen and some touchpad drivers work.
+        if ((ms->flags & LLMHF_INJECTED) && !IsPointerSynthesized(ms->dwExtraInfo))
             goto forward;
 
         // Recovery path: if a non-modifier click occurs while stale drag/resize state exists, clear it.
