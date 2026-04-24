@@ -920,7 +920,7 @@ static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam)
 
         // Skip software-injected events (SendInput / mouse_event) to avoid
         // interference, but allow touch/pen-synthesized events through so
-        // that touchscreen and some touchpad drivers work.
+        // that touch screen and some touchpad drivers work.
         if ((ms->flags & LLMHF_INJECTED) && !IsPointerSynthesized(ms->dwExtraInfo))
             goto forward;
 
@@ -1204,6 +1204,161 @@ static void HandleDragResize(POINT pt)
                  SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
     RepositionOverlay(nr.left, nr.top, w, h);
 }
+
+// ---------------------------------------------------------------------------
+// Overlay window procedure – handles WM_POINTER* events for touch/pen/touchpad
+// input that arrives directly at the overlay during an active drag or resize.
+// The low-level mouse hook continues to handle synthesized mouse messages;
+// this provides a complementary path for pointer devices.
+// ---------------------------------------------------------------------------
+static LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    switch (msg)
+    {
+    case WM_POINTERDOWN:
+    {
+        if (!IsActivationModifierPressed())
+            break;
+
+        UINT32 pointerId = GET_POINTERID_WPARAM(wParam);
+        POINTER_INFO pi = {};
+        if (!GetPointerInfo(pointerId, &pi))
+            break;
+
+        POINT pt = pi.ptPixelLocation;
+
+        // First button (left-click / single-finger touch) → start drag
+        if (IS_POINTER_FIRSTBUTTON_WPARAM(wParam) && !g_dragging && !g_resizing)
+        {
+            if (IsSuppressedByGameMode())
+                break;
+
+            // Hide overlay momentarily to hit-test the window below
+            ShowWindow(hwnd, SW_HIDE);
+            HWND target = ResolveTargetWindow(pt);
+            ShowWindow(hwnd, SW_SHOWNA);
+
+            if (target && !IsExcluded(target))
+            {
+                g_dragging = true;
+                g_dragFirstMove = true;
+                g_dragConsumedAlt = true;
+                g_dragTarget = target;
+                g_dragStart = pt;
+                GetWindowRect(target, &g_dragWndRect);
+                ShowOverlay(g_dragWndRect, g_curSizeAll);
+                TraceShortcutUse(true, GrabAndMoveShortcutAction::Move, L"started_pointer");
+                return 0;
+            }
+        }
+
+        // Second button (right-click equivalent) → start resize
+        if (IS_POINTER_SECONDBUTTON_WPARAM(wParam) && g_useAltResize && !g_dragging && !g_resizing)
+        {
+            if (IsSuppressedByGameMode())
+                break;
+
+            ShowWindow(hwnd, SW_HIDE);
+            HWND target = ResolveTargetWindow(pt);
+            ShowWindow(hwnd, SW_SHOWNA);
+
+            if (target && !IsExcluded(target))
+            {
+                if (!(GetWindowLongW(target, GWL_STYLE) & WS_THICKFRAME))
+                    break;
+
+                g_resizing = true;
+                g_resizeFirstMove = true;
+                g_dragConsumedAlt = true;
+                g_resizeTarget = target;
+                g_resizeLast = pt;
+                GetWindowRect(target, &g_resizeWndRect);
+                g_currentHandle = GetClosestHandle(pt, g_resizeWndRect);
+                ShowOverlay(g_resizeWndRect, CursorForHandle(g_currentHandle));
+                TraceShortcutUse(true, GrabAndMoveShortcutAction::Resize, L"started_pointer");
+                return 0;
+            }
+        }
+        break;
+    }
+
+    case WM_POINTERUPDATE:
+    {
+        UINT32 pointerId = GET_POINTERID_WPARAM(wParam);
+        POINTER_INFO pi = {};
+        if (!GetPointerInfo(pointerId, &pi))
+            break;
+
+        POINT pt = pi.ptPixelLocation;
+
+        if (g_dragging && g_dragTarget)
+        {
+            ULONGLONG now = QpcMs();
+            if (now - g_lastMoveTick >= THROTTLE_INTERVAL_MS)
+            {
+                g_lastMoveTick = now;
+                HandleDragMove(pt);
+            }
+            return 0;
+        }
+
+        if (g_resizing && g_resizeTarget)
+        {
+            ULONGLONG now = QpcMs();
+            if (now - g_lastMoveTick >= THROTTLE_INTERVAL_MS)
+            {
+                g_lastMoveTick = now;
+                HandleDragResize(pt);
+            }
+            return 0;
+        }
+        break;
+    }
+
+    case WM_POINTERUP:
+    {
+        UINT32 pointerId = GET_POINTERID_WPARAM(wParam);
+        POINTER_INFO pi = {};
+        if (!GetPointerInfo(pointerId, &pi))
+            break;
+
+        POINT pt = pi.ptPixelLocation;
+
+        if (g_dragging && g_dragTarget)
+        {
+            // Flush final position
+            int dx = pt.x - g_dragStart.x;
+            int dy = pt.y - g_dragStart.y;
+            int newX = g_dragWndRect.left + dx;
+            int newY = g_dragWndRect.top + dy;
+            SetWindowPos(g_dragTarget, nullptr, newX, newY, 0, 0,
+                         SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+            EndInteraction(true, false);
+            return 0;
+        }
+
+        if (g_resizing && g_resizeTarget)
+        {
+            RECT nr = g_resizeWndRect;
+            int w = nr.right - nr.left;
+            int h = nr.bottom - nr.top;
+            SetWindowPos(g_resizeTarget, nullptr, nr.left, nr.top, w, h,
+                         SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+            EndInteraction(false, true);
+            return 0;
+        }
+        break;
+    }
+
+    case WM_POINTERCAPTURECHANGED:
+        // Pointer capture was lost — end any active interaction
+        EndInteraction(true, true);
+        return 0;
+    }
+
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     switch (msg)
@@ -1304,7 +1459,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int)
     // Register the overlay window class (white background, ARROW cursor)
     WNDCLASSEXW overlayWindowClass = {};
     overlayWindowClass.cbSize = sizeof(overlayWindowClass);
-    overlayWindowClass.lpfnWndProc = DefWindowProcW;
+    overlayWindowClass.lpfnWndProc = OverlayWndProc;
     overlayWindowClass.hInstance = hInstance;
     overlayWindowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     overlayWindowClass.hbrBackground = static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH));
